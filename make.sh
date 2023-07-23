@@ -1,2 +1,3 @@
 #!/usr/bin/env bash
-python setup.py build develop
+CUDA_HOME=/usr/local/cuda \
+  python setup.py build develop
