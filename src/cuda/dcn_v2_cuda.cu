@@ -3,6 +3,9 @@
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
+//#include <ATen/cuda/CUDABlas.h>
+
+#include <cublas_v2.h>
 
 #include <THC/THC.h>
 #include <THC/THCAtomics.cuh>
@@ -37,6 +40,152 @@ __global__ void createBatchGemmBuffer(const float **input_b, float **output_b,
         weight_b[idx] = weight;
         bias_b[idx] = bias;
     }
+}
+
+static cublasOperation_t convertTransToCublasOperation(char trans) {
+  if (trans == 't') return CUBLAS_OP_T;
+  else if (trans == 'n') return CUBLAS_OP_N;
+  else if (trans == 'c') return CUBLAS_OP_C;
+  else {
+    THError("trans must be one of: t, n, c");
+    return CUBLAS_OP_T;
+  }
+}
+
+static void adjustLdLevel3(char transa, char transb, int64_t m, int64_t n, int64_t k, int64_t *lda, int64_t *ldb, int64_t *ldc)
+{
+  int transa_ = ((transa == 't') || (transa == 'T'));
+  int transb_ = ((transb == 't') || (transb == 'T'));
+
+  // Note: leading dimensions generally are checked that they are > 0 and at least as big the result
+  // requires (even if the value won't be used).
+  if(n <= 1)
+    *ldc = std::max<int64_t>(m, 1);
+
+  if(transa_)
+  {
+    if(m <= 1)
+      *lda = std::max<int64_t>(k, 1);
+  }
+  else
+  {
+    if(k <= 1)
+      *lda = std::max<int64_t>(m, 1);
+  }
+
+  if(transb_)
+  {
+    if(k <= 1)
+      *ldb = std::max<int64_t>(n, 1);
+  }
+  else
+  {
+    if(n <= 1)
+      *ldb = std::max<int64_t>(k, 1);
+  }
+
+}
+
+static void _cublasAdjustLdLevel3(
+    char transa,
+    char transb,
+    int64_t m,
+    int64_t n,
+    int64_t k,
+    int64_t* lda,
+    int64_t* ldb,
+    int64_t* ldc) {
+  bool transa_ = ((transa == 't') || (transa == 'T'));
+  bool transb_ = ((transb == 't') || (transb == 'T'));
+
+  // Note: leading dimensions generally are checked that they are > 0
+  // and at least as big the result requires (even if the value won't
+  // be used).
+  if (n <= 1)
+    *ldc = std::max<int64_t>(m, 1);
+
+  if (transa_) {
+    if (m <= 1)
+      *lda = std::max<int64_t>(k, 1);
+  } else {
+    if (k <= 1)
+      *lda = std::max<int64_t>(m, 1);
+  }
+
+  if (transb_) {
+    if (k <= 1)
+      *ldb = std::max<int64_t>(n, 1);
+  } else {
+    if (n <= 1)
+      *ldb = std::max<int64_t>(k, 1);
+  }
+}
+
+static cublasOperation_t _cublasOpFromChar(char op) {
+  switch (op) {
+    case 'n':
+    case 'N':
+      return CUBLAS_OP_N;
+    case 't':
+    case 'T':
+      return CUBLAS_OP_T;
+    case 'c':
+    case 'C':
+      return CUBLAS_OP_C;
+  }
+  AT_ERROR(
+      "_cublasOpFromChar input should be 't', 'n' or 'c' but got `", op, "`");
+}
+
+static void my_THCudaBlas_SgemmBatched(THCState *state, char transa, char transb, int64_t m, int64_t n, int64_t k,
+                             float alpha, const float *a[], int64_t lda, const float *b[], int64_t ldb,
+                             float beta, float *c[], int64_t ldc, int64_t batchCount)
+{
+  // See Note [Writing Nondeterministic Operations]
+  at::globalContext().alertCuBLASConfigNotDeterministic();
+  if( (m >= INT_MAX) || (n >= INT_MAX) || (k >= INT_MAX) || (lda >= INT_MAX)  || (ldb >= INT_MAX) || (ldc >= INT_MAX) || (batchCount >= INT_MAX) )
+  {
+    THError("Cublas_SgemmBatched only supports m, n, k, lda, ldb, ldc, batchCount"
+            "with the bound [val] <= %d", INT_MAX);
+  }
+
+#ifdef __HIP_PLATFORM_HCC__
+#error foo
+  const int64_t stridea = (transa == 'N' || transa == 'n') ? lda*k : lda*n;
+  const int64_t strideb = (transb == 'N' || transb == 'n') ? ldb*n : ldb*k;
+  const int64_t stridec = ldc*n;
+
+  THCudaBlas_SgemmStridedBatched(state, transa, transb, m, n, k, alpha, *a, lda, stridea, *b, ldb, strideb, beta, *c, ldc, stridec, batchCount);
+
+#else
+
+  adjustLdLevel3(transa, transb, m, n, k, &lda, &ldb, &ldc);
+  cublasOperation_t opa = convertTransToCublasOperation(transa);
+  cublasOperation_t opb = convertTransToCublasOperation(transb);
+
+  cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+  THCublasCheck(cublasSgemmBatched(handle,
+                                   opa, opb, (int)m, (int)n, (int)k,
+                                   &alpha, a, (int)lda, b, (int)ldb, &beta, c, (int)ldc,
+                                   (int)batchCount));
+#endif
+}
+
+/* Level 3 */
+void my_THCudaBlas_Sgemm(THCState *state, char transa, char transb, int64_t m, int64_t n, int64_t k, float alpha, float *a, int64_t lda, float *b, int64_t ldb, float beta, float *c, int64_t ldc)
+{
+  //at::cuda::blas::gemm<float>(transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
+
+  // See Note [Writing Nondeterministic Operations]
+  //globalContext().alertCuBLASConfigNotDeterministic();
+  cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+  cublasOperation_t opa = _cublasOpFromChar(transa);
+  cublasOperation_t opb = _cublasOpFromChar(transb);
+  _cublasAdjustLdLevel3(transa, transb, m, n, k, &lda, &ldb, &ldc);
+  //GEMM_CHECK_ARGVALUES(float);
+  /*TORCH_CUDABLAS_CHECK(*/cublasStatus_t err = cublasSgemm(
+      handle, opa, opb, m, n, k, &alpha, a, lda, b, ldb, &beta, c, ldc)/*)*/;
+  TORCH_CHECK(err == CUBLAS_STATUS_SUCCESS, "cublasSgemm error: ", err);
 }
 
 at::Tensor
@@ -123,7 +272,7 @@ dcn_v2_cuda_forward(const at::Tensor &input,
     long m_ = channels_out;
     long n_ = height_out * width_out;
     long k_ = 1;
-    THCudaBlas_SgemmBatched(state,
+    my_THCudaBlas_SgemmBatched(state,
                             't',
                             'n',
                             n_,
@@ -149,7 +298,7 @@ dcn_v2_cuda_forward(const at::Tensor &input,
     long m = channels_out;
     long n = height_out * width_out;
     long k = channels * kernel_h * kernel_w;
-    THCudaBlas_SgemmBatched(state,
+    my_THCudaBlas_SgemmBatched(state,
                             'n',
                             'n',
                             n,
@@ -270,7 +419,7 @@ std::vector<at::Tensor> dcn_v2_cuda_backward(const at::Tensor &input,
         long n = height_out * width_out;
         long k = channels_out;
 
-        THCudaBlas_Sgemm(state, 'n', 't', n, m, k, 1.0f,
+        my_THCudaBlas_Sgemm(state, 'n', 't', n, m, k, 1.0f,
                          grad_output_n.data_ptr<scalar_t>(), n,
                          weight.data_ptr<scalar_t>(), m, 0.0f,
                          columns.data_ptr<scalar_t>(), n);
@@ -313,7 +462,7 @@ std::vector<at::Tensor> dcn_v2_cuda_backward(const at::Tensor &input,
         long n_ = channels * kernel_h * kernel_w;
         long k_ = height_out * width_out;
 
-        THCudaBlas_Sgemm(state, 't', 'n', n_, m_, k_, 1.0f,
+        my_THCudaBlas_Sgemm(state, 't', 'n', n_, m_, k_, 1.0f,
                          columns.data_ptr<scalar_t>(), k_,
                          grad_output_n.data_ptr<scalar_t>(), k_, 1.0f,
                          grad_weight.data_ptr<scalar_t>(), n_);
@@ -321,13 +470,13 @@ std::vector<at::Tensor> dcn_v2_cuda_backward(const at::Tensor &input,
         // gradient w.r.t. bias
         // long m_ = channels_out;
         // long k__ = height_out * width_out;
-        // THCudaBlas_Sgemm(state,
+        // my_THCudaBlas_Sgemm(state,
         //                  't', 'n',
         //                  k_, m_, 1, 1.0f,
         //                  grad_output_n.data_ptr<scalar_t>(), k_,
         //                  ones.data_ptr<scalar_t>(), 1, 1.0f,
         //                  grad_bias.data_ptr<scalar_t>(), 1);
-        THCudaBlas_Sgemm(state,
+        my_THCudaBlas_Sgemm(state,
             'N', 'N', 1, m_, k_, 1.0f,
             ones.data_ptr<scalar_t>(), 1,
             grad_output_n.data_ptr<scalar_t>(), k_,
