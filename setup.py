@@ -22,7 +22,7 @@ def get_extensions():
     os.environ["CC"] = "g++"
     sources = main_file + source_cpu
     extension = CppExtension
-    extra_compile_args = {"cxx": []}
+    extra_compile_args = {"cxx": [f"-I{os.getcwd()}/../external/pybind11/include"]}
     extra_libraries = []
     define_macros = []
 
