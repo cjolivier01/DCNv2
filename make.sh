@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
-sudo rm *.so
-sudo rm -r build/
-sudo python3 setup.py build develop
+CUDA_HOME=/usr/local/cuda \
+  PATH=/usr/local/cuda/bin:"$PATH" \
+  python setup.py build develop
